@@ -1,0 +1,340 @@
+############################################################
+# GSE63577: functional enrichment with gprofiler2
+# - Per-cell line enrichment (GO + KEGG) on DEGs
+# - Separate analysis for up/down vs combined
+# - KEGG barplots per cell line
+# - Combined KEGG dotplots across cell lines
+############################################################
+
+## 0. Libraries and configuration ---------------------------------------------
+
+library(gprofiler2)   # gost() for functional enrichment[web:51]
+library(dplyr)
+library(ggplot2)
+library(openxlsx)
+library(readxl)
+library(limma)
+
+# Thresholds for DEGs
+adjp_value_threshold <- 0.05
+logFC_threshold      <- 0.58
+
+# Output directory (adapt as needed)
+enrich_dir      <- file.path("Enrich_gprofiler")
+enrich_dir_nodis <- file.path(enrich_dir, "No_Dis")
+dir.create(enrich_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(enrich_dir_nodis, recursive = TRUE, showWarnings = FALSE)
+
+# Gene annotation (if not already in memory)
+# Homo_sapiens_GRCh38_110_gtf_entrez <- read_excel("Homo_sapiens.GRCh38.110.gtf.entrez.xlsx")
+
+############################################################
+# 1. Helper functions
+############################################################
+
+# Build DEG table with flags (up/down/NS) and annotation
+build_deg_table <- function(fit, coef_name, annot,
+                            adjp_thresh = adjp_value_threshold,
+                            logfc_thresh = logFC_threshold) {
+  tt <- topTable(
+    fit,
+    coef          = coef_name,
+    number        = Inf,
+    adjust.method = "BH"
+  )
+
+  tt <- tt[order(tt$logFC, decreasing = TRUE), ]
+
+  tt_annot <- merge(
+    tt,
+    annot,
+    by.x    = "GeneID",
+    by.y    = "gene_id",
+    all.y   = TRUE,
+    sort    = FALSE,
+    suffixes = c("_deg", "_annot")
+  )
+
+  tt_annot <- tt_annot[!is.na(tt_annot$logFC), ]
+
+  tt_annot$flag <- ifelse(
+    tt_annot$adj.P.Val < adjp_thresh & tt_annot$logFC >  logfc_thresh, "up",
+    ifelse(
+      tt_annot$adj.P.Val < adjp_thresh & tt_annot$logFC < -logfc_thresh, "down",
+      "NS"
+    )
+  )
+
+  tt_annot
+}
+
+# Single-list enrichment (up+down together)
+run_enrichment_single <- function(ens_ids,
+                                  label,
+                                  out_prefix,
+                                  sources = c("GO:BP", "GO:MF", "GO:CC", "KEGG")) {
+
+  gp <- gost(
+    query     = ens_ids,
+    organism  = "hsapiens",
+    sources   = sources,
+    evcodes   = TRUE
+  )[web:51][web:53]
+
+  res <- gp$result
+
+  write.xlsx(
+    res,
+    file.path(enrich_dir_nodis, paste0("Enrich_tbl_", label, "_GSE63577.xlsx"))
+  )
+
+  # Filter KEGG terms for plotting
+  kegg_res <- res %>%
+    filter(source == "KEGG", term_size <= 300) %>%
+    mutate(
+      term_name = factor(term_name, levels = unique(term_name[order(intersection_size)]))
+    )
+
+  kegg_res <- kegg_res %>%
+    mutate(term_name = as.character(term_name)) %>%
+    arrange(term_name)
+
+  write.xlsx(
+    kegg_res,
+    file.path(enrich_dir_nodis, paste0("KEGG_", label, "_GSE63577.xlsx"))
+  )
+
+  # KEGG barplot (intersection size vs term)
+  p <- ggplot(kegg_res, aes(x = intersection_size, y = term_name, fill = p_value)) +
+    geom_bar(stat = "identity") +
+    scale_fill_gradient(low = "blue", high = "red") +
+    theme_minimal() +
+    labs(
+      x    = "Intersection size",
+      y    = "",
+      fill = "p-value"
+    ) +
+    theme(
+      axis.text.y       = element_text(size = 8),
+      strip.text.y      = element_text(size = 10, angle = 0),
+      strip.placement   = "outside",
+      strip.background  = element_blank()
+    ) +
+    geom_vline(xintercept = 0, linetype = "dashed")
+
+  list(full = res, kegg = kegg_res, plot = p)
+}
+
+# Up vs down enrichment (multi-query)
+run_enrichment_up_down <- function(up_names,
+                                   down_names,
+                                   label,
+                                   sources = c("GO:BP", "GO:MF", "GO:CC", "KEGG")) {
+
+  gp <- gost(
+    query    = list("up-regulated" = up_names, "down-regulated" = down_names),
+    organism = "hsapiens",
+    sources  = sources,
+    evcodes  = TRUE
+  )[web:51][web:53]
+
+  res <- gp$result
+
+  write.xlsx(
+    res,
+    file.path(enrich_dir, paste0("Enrich_tbl_", label, "_GSE63577.xlsx"))
+  )
+
+  kegg_df <- res %>%
+    filter(source == "KEGG", term_size <= 300) %>%
+    mutate(
+      regulation = ifelse(grepl("down", query), "down-regulated", "up-regulated"),
+      term_name  = factor(term_name, levels = unique(term_name[order(intersection_size)]))
+    )
+
+  kegg_df <- kegg_df %>%
+    mutate(term_name = as.character(term_name)) %>%
+    arrange(term_name)
+
+  write.xlsx(
+    kegg_df,
+    file.path(enrich_dir, paste0("KEGG_", label, "_GSE63577.xlsx"))
+  )
+
+  p <- ggplot(kegg_df, aes(x = intersection_size, y = term_name, fill = p_value)) +
+    geom_bar(stat = "identity") +
+    facet_grid(regulation ~ ., scales = "free_y", space = "free_y") +
+    scale_fill_gradient(low = "blue", high = "red") +
+    theme_minimal() +
+    labs(
+      x    = "Intersection size",
+      y    = "",
+      fill = "p-value"
+    ) +
+    theme(
+      axis.text.y       = element_text(size = 8),
+      strip.text.y      = element_text(size = 10, angle = 0),
+      strip.placement   = "outside",
+      strip.background  = element_blank()
+    ) +
+    geom_vline(xintercept = 0, linetype = "dashed")
+
+  list(full = res, kegg = kegg_df, plot = p)
+}
+
+############################################################
+# 2. Enrichment per cell line
+############################################################
+
+# Assumes:
+# - fit : limma fit object (from Script 2)
+# - Homo_sapiens_GRCh38_110_gtf_entrez : annotation table with ens_gene_id and gene_name
+
+coef_map <- c(
+  HFF   = "oHFF_yHFF",
+  MRC5  = "oMRC5_yMRC5",
+  IMR90 = "oIMR90_yIMR90",
+  BJ    = "oBJ_yBJ",
+  WI38  = "oWI38_yWI38"
+)
+
+deg_tables <- list()
+single_enrich <- list()
+multi_enrich  <- list()
+
+for (cl in names(coef_map)) {
+  coef_name <- coef_map[[cl]]
+
+  message("Processing ", cl, " (contrast: ", coef_name, ")")
+
+  # 1) Build DEG + annotation + flag
+  deg_cl <- build_deg_table(
+    fit   = fit,
+    coef_name = coef_name,
+    annot = Homo_sapiens_GRCh38_110_gtf_entrez
+  )
+  deg_tables[[cl]] <- deg_cl
+
+  # 2) Up + down combined (using Ensembl IDs if available, otherwise gene_name)
+  sig_deg <- deg_cl %>% filter(flag %in% c("up", "down"))
+  ens_ids <- sig_deg$ens_gene_id
+  ens_ids <- ens_ids[!is.na(ens_ids) & ens_ids != ""]
+
+  if (length(ens_ids) > 0) {
+    single_res <- run_enrichment_single(
+      ens_ids    = ens_ids,
+      label      = cl,
+      out_prefix = cl
+    )
+    single_enrich[[cl]] <- single_res
+  } else {
+    warning("No valid Ensembl IDs for ", cl, " in combined enrichment.")
+  }
+
+  # 3) Up vs down separate (using gene_name، چون در g:Profiler می‌توان از نام ژن هم استفاده کرد)[web:51][web:55]
+  up_cl   <- deg_cl %>% filter(flag == "up")   %>% arrange(desc(logFC))
+  down_cl <- deg_cl %>% filter(flag == "down") %>% arrange(desc(logFC))
+
+  up_names   <- up_cl$gene_name[!is.na(up_cl$gene_name) & up_cl$gene_name != ""]
+  down_names <- down_cl$gene_name[!is.na(down_cl$gene_name) & down_cl$gene_name != ""]
+
+  if (length(up_names) > 0 && length(down_names) > 0) {
+    multi_res <- run_enrichment_up_down(
+      up_names   = up_names,
+      down_names = down_names,
+      label      = paste0("o", cl, "_vs_y", cl)
+    )
+    multi_enrich[[cl]] <- multi_res
+  } else {
+    warning("Insufficient gene symbols for up/down enrichment in ", cl)
+  }
+}
+
+############################################################
+# 3. Combined KEGG dotplots across cell lines
+############################################################
+
+# Collect KEGG (with regulation) from multi_enrich
+kegg_multi_all <- bind_rows(lapply(names(multi_enrich), function(cl) {
+  df <- multi_enrich[[cl]]$kegg
+  df$cell_line <- cl
+  df
+}))
+
+write.xlsx(
+  kegg_multi_all,
+  file.path(enrich_dir, "KEGG_5Cell_type_up_down_GSE63577.xlsx")
+)
+
+# Ensure term_name is character and sort alphabetically
+kegg_multi_all <- kegg_multi_all %>%
+  mutate(term_name = as.character(term_name)) %>%
+  arrange(term_name)
+
+combined_dotplot <- ggplot(
+  kegg_multi_all,
+  aes(x = cell_line, y = term_name, size = intersection_size, color = regulation)
+) +
+  geom_point(alpha = 0.7) +
+  scale_size_continuous(range = c(3, 10)) +
+  scale_color_manual(values = c("up-regulated" = "red", "down-regulated" = "blue")) +
+  theme_minimal() +
+  labs(
+    x    = "Cell line",
+    y    = "KEGG terms",
+    size = "Intersection size",
+    color = "Regulation"
+  ) +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1),
+    axis.text.y      = element_text(size = 8),
+    strip.text.y     = element_text(size = 10, angle = 0),
+    strip.placement  = "outside",
+    strip.background = element_blank()
+  )
+
+############################################################
+# 4. Combined KEGG dotplot without distinguishing up/down
+############################################################
+
+# Collect KEGG from single_enrich (no regulation split)
+kegg_single_all <- bind_rows(lapply(names(single_enrich), function(cl) {
+  df <- single_enrich[[cl]]$kegg
+  df$cell_line <- cl
+  df
+}))
+
+write.xlsx(
+  kegg_single_all,
+  file.path(enrich_dir_nodis, "KEGG_No_Dis_5Cell_type_GSE63577.xlsx")
+)
+
+kegg_single_all <- kegg_single_all %>%
+  mutate(term_name = as.character(term_name)) %>%
+  arrange(term_name)
+
+TT_combined_plot <- ggplot(
+  kegg_single_all,
+  aes(x = cell_line, y = term_name, size = intersection_size, color = p_value)
+) +
+  geom_point(alpha = 0.7) +
+  scale_size_continuous(range = c(3, 10)) +
+  scale_color_gradient(low = "blue", high = "red") +
+  theme_minimal() +
+  labs(
+    x    = "Cell line",
+    y    = "KEGG terms",
+    size = "Intersection size",
+    color = "p-value"
+  ) +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1),
+    axis.text.y      = element_text(size = 8),
+    strip.text.y     = element_text(size = 10, angle = 0),
+    strip.placement  = "outside",
+    strip.background = element_blank()
+  )
+
+############################################################
+# End of script
+############################################################
