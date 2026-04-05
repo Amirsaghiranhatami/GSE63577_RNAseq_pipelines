@@ -1,0 +1,340 @@
+############################################################
+# GSE63577 RNA‑seq raw counts preprocessing
+# - Download count matrix from GEO
+# - Filter lowly expressed genes
+# - Basic QC plots
+# - Build sample and gene annotation tables
+############################################################
+
+## Load required packages ----------------------------------
+
+library(data.table)
+library(edgeR)
+library(grDevices)
+library(BiocGenerics)
+library(Biobase)
+library(pcaMethods)
+library(plotrix)
+library(vsn)
+library(DESeq2)
+library(SummarizedExperiment)
+library(pals)
+library(ComplexHeatmap)
+library(knitr)
+library(omicsTools)
+
+############################################################
+# 1. Download and import count data
+############################################################
+
+# GEO series ID: GSE63577
+base_url <- "https://www.ncbi.nlm.nih.gov/geo/download/?format=file&type=rnaseq_counts"
+
+# Build full download URL
+counts_url <- paste(
+  base_url,
+  "acc=GSE63577",
+  "file=GSE63577_raw_counts_GRCh38.p13_NCBI.tsv.gz",
+  sep = "&"
+)
+
+# Read counts table
+# Assumes a column 'GeneID' with gene identifiers
+counts_dt <- data.table::fread(counts_url, header = TRUE)
+
+GSE63577 <- as.data.frame(counts_dt)
+rownames(GSE63577) <- GSE63577$GeneID
+GSE63577$GeneID <- NULL
+
+# Remove specific samples:
+# - middle stage for MRC5 (passage 52, 62)
+# - middle stage for HFF  (passage 26, 46, 64)
+# NOTE: indices assume original column ordering
+GSE63577 <- GSE63577[, -46]
+GSE63577 <- GSE63577[, -c(28:36, 40:45)]
+
+############################################################
+# 2. Filter and normalize count data
+############################################################
+
+#' Filter and QC RNA‑seq count matrix
+#'
+#' @param X genes-by-samples count matrix
+#' @param out_dir output directory for QC plots
+#' @param col vector of point colors (length = ncol(X)); if NULL, a default is used
+#' @param min.cpm minimum counts per million in at least min.samples samples
+#' @param min.counts minimum raw count if filter.by.cpm = FALSE
+#' @param min.samples minimum number of samples a gene must be expressed in
+#' @param prior.count prior.count for cpm() when log = TRUE
+#' @param filter.by.cpm if TRUE, filter by CPM; otherwise filter by raw counts
+#' @param width, height, res, units graphical parameters for plots
+#'
+#' @return filtered count matrix
+#'
+filter_counts <- function(
+  X,
+  out_dir       = "filtering_result",
+  col           = NULL,
+  width         = 180,
+  height        = 180,
+  res           = 300,
+  units         = "mm",
+  prior.count   = 3,
+  filter.by.cpm = TRUE,
+  min.cpm       = 3,
+  min.counts    = 10,
+  subset.remove = NULL,
+  min.samples   = NULL
+) {
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # Replace NAs with zero
+  X[is.na(X)] <- 0
+
+  # Optionally remove specific samples
+  if (!is.null(subset.remove)) {
+    message("Removing ", sum(colnames(X) %in% subset.remove), " samples.")
+    X <- X[, !colnames(X) %in% subset.remove, drop = FALSE]
+  }
+
+  # Default colors: one per sample
+  if (is.null(col)) {
+    col <- seq_len(ncol(X))
+  }
+
+  ## FILTERING
+  message("FILTERING...")
+
+  # Remove all-zero genes
+  zero_rows <- rowSums(X) == 0
+  if (any(zero_rows)) {
+    message("Removing ", sum(zero_rows), " all-zero genes.")
+    X <- X[!zero_rows, , drop = FALSE]
+  }
+
+  # Default: gene must be expressed in at least 25% of samples
+  if (is.null(min.samples)) {
+    min.samples <- round(ncol(X) * 0.25)
+  }
+
+  # Create DGEList object
+  dge <- DGEList(X)
+
+  if (filter.by.cpm) {
+    # Filter by CPM
+    cpm_values <- cpm(dge)
+    message(
+      "Keeping genes with at least ", min.cpm,
+      " CPM in ", min.samples, " samples..."
+    )
+    keep <- rowSums(cpm_values >= min.cpm) >= min.samples
+  } else {
+    # Filter by raw counts
+    message(
+      "Keeping genes with at least ", min.counts,
+      " counts in ", min.samples, " samples..."
+    )
+    keep <- rowSums(X >= min.counts) >= min.samples
+  }
+
+  print(table(keep))
+
+  X_filt <- X[keep, , drop = FALSE]
+  message("Filtered counts dimensions: ", paste(dim(X_filt), collapse = " x "))
+
+  ## log-CPM for QC plots
+  dge_all  <- DGEList(X)
+  lcpm_all <- cpm(dge_all, log = TRUE, prior.count = prior.count)
+
+  dge_filt  <- DGEList(X_filt)
+  lcpm_filt <- cpm(dge_filt, log = TRUE, prior.count = prior.count)
+
+  ## Density plots: raw vs filtered
+  jpeg(
+    filename = file.path(out_dir, "density.jpg"),
+    width    = width,
+    height   = height / 2,
+    res      = res,
+    units    = units
+  )
+
+  par(mfrow = c(1, 2))
+
+  dens_all <- apply(lcpm_all, 2, density)
+  xlim_all <- summary(unlist(lapply(dens_all, function(x) x$x)))[c(1, 6)]
+  ylim_all <- summary(unlist(lapply(dens_all, function(x) x$y)))[c(1, 6)]
+
+  plot(
+    dens_all[[1]]$x, dens_all[[1]]$y,
+    xlim = xlim_all, ylim = ylim_all,
+    xlab = "log-CPM", ylab = "Density",
+    main = "Raw", type = "l"
+  )
+  for (i in 2:length(dens_all)) {
+    lines(dens_all[[i]]$x, dens_all[[i]]$y, col = i)
+  }
+  abline(v = 0, lty = 2)
+
+  dens_filt <- apply(lcpm_filt, 2, density)
+  xlim_filt <- summary(unlist(lapply(dens_filt, function(x) x$x)))[c(1, 6)]
+  ylim_filt <- summary(unlist(lapply(dens_filt, function(x) x$y)))[c(1, 6)]
+
+  plot(
+    dens_filt[[1]]$x, dens_filt[[1]]$y,
+    xlim = xlim_filt, ylim = ylim_filt,
+    xlab = "log-CPM", ylab = "Density",
+    main = "Filtered", type = "l"
+  )
+  for (i in 2:length(dens_filt)) {
+    lines(dens_filt[[i]]$x, dens_filt[[i]]$y, col = i)
+  }
+  abline(v = 0, lty = 2)
+
+  dev.off()
+
+  ## Number of samples per gene and genes per sample
+  n_samples_per_gene <- rowSums(sign(X_filt))
+  n_genes_per_sample <- colSums(sign(X_filt))
+
+  png(
+    filename = file.path(out_dir, "library.size.genes.png"),
+    width    = width,
+    height   = height / 2,
+    units    = "mm",
+    res      = 300
+  )
+
+  par(mfrow = c(1, 2))
+  par(mgp = c(2, 0.5, 0))
+
+  hist(
+    n_samples_per_gene,
+    breaks = 20,
+    xlab   = "Number of samples",
+    ylab   = "Number of genes",
+    main   = "Gene occurrence in samples",
+    cex.lab = 0.6,
+    cex     = 0.6,
+    cex.axis = 0.6,
+    las      = 2,
+    cex.main = 0.6
+  )
+
+  hist(
+    n_genes_per_sample,
+    breaks = 20,
+    xlab   = "Number of genes",
+    ylab   = "Number of samples",
+    main   = "Number of expressed genes",
+    cex.lab = 0.6,
+    cex     = 0.6,
+    cex.axis = 0.6,
+    las      = 2,
+    cex.main = 0.6
+  )
+
+  dev.off()
+
+  ## Library size vs number of expressed genes (log-log)
+  png(
+    filename = file.path(out_dir, "library_sizes.ngenes.counts.png"),
+    width    = width,
+    height   = height,
+    units    = "mm",
+    res      = 300
+  )
+
+  par(mgp = c(1.5, 0.5, 0))
+
+  plot(
+    colSums(X_filt),
+    n_genes_per_sample,
+    cex      = 0.6,
+    col      = col,
+    xlab     = "# reads",
+    ylab     = "# genes",
+    pch      = 16,
+    log      = "xy",
+    cex.axis = 0.6,
+    cex.lab  = 0.6
+  )
+
+  dev.off()
+
+  return(X_filt)
+}
+
+############################################################
+# 3. Apply filtering to GSE63577
+############################################################
+
+GSE63577_filtered <- filter_counts(
+  X            = GSE63577,
+  out_dir      = "filtering_result",
+  filter.by.cpm = TRUE,
+  min.cpm      = 3,
+  min.samples  = 8
+)
+
+############################################################
+# 4. Sample annotation
+############################################################
+
+sample_ids <- c(
+  "GSM1553085", "GSM1553086", "GSM1553087",
+  "GSM1553088", "GSM1553089", "GSM1553090",
+  "GSM1553091", "GSM1553092", "GSM1553093",
+  "GSM1553094", "GSM1553095", "GSM1553096",
+  "GSM1553097", "GSM1553098", "GSM1553099",
+  "GSM1553100", "GSM1553101", "GSM1553102",
+  "GSM1553103", "GSM1553104", "GSM1553105",
+  "GSM1553106", "GSM1553107", "GSM1553108",
+  "GSM1553109", "GSM1553110", "GSM1553111",
+  "GSM1915569", "GSM1915570", "GSM1915571"
+)
+
+cell_type <- c(
+  "MRC_5", "MRC_5", "MRC_5",
+  "BJ", "BJ", "BJ", "BJ", "BJ", "BJ",
+  "HFF", "HFF", "HFF", "HFF", "HFF", "HFF",
+  "IMR90", "IMR90", "IMR90", "IMR90", "IMR90", "IMR90",
+  "WI_38", "WI_38", "WI_38", "WI_38", "WI_38", "WI_38",
+  "MRC_5", "MRC_5", "MRC_5"
+)
+
+passages <- c(
+  "MRCold", "MRCold", "MRCold",
+  "BJyoung", "BJyoung", "BJyoung",
+  "BJold", "BJold", "BJold",
+  "HFFyoung", "HFFyoung", "HFFyoung",
+  "HFFold", "HFFold", "HFFold",
+  "IMRyoung", "IMRyoung", "IMRyoung",
+  "IMRold", "IMRold", "IMRold",
+  "WIyoung", "WIyoung", "WIyoung",
+  "WIold", "WIold", "WIold",
+  "MRCyoung", "MRCyoung", "MRCyoung"
+)
+
+sample_info <- data.frame(
+  SampleID  = sample_ids,
+  Cell_type = cell_type,
+  Passage   = passages,
+  stringsAsFactors = FALSE
+)
+rownames(sample_info) <- sample_info$SampleID
+
+############################################################
+# 5. Gene annotation
+############################################################
+
+gene_ids <- rownames(GSE63577_filtered)
+
+gene_info <- data.frame(
+  GeneID = gene_ids,
+  stringsAsFactors = FALSE
+)
+rownames(gene_info) <- gene_ids
+
+############################################################
+# End of script
+############################################################
