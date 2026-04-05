@@ -1,0 +1,515 @@
+############################################################
+# GSE63577: normalization and differential expression
+# - TMM + DESeq2 vst normalization
+# - QC plots (mean-SD, RLE, library size, PCA, MDS)
+# - Differential expression (omicsTools::differential_expression)
+############################################################
+
+## Load required packages ----------------------------------
+
+library(edgeR)
+library(DESeq2)
+library(pcaMethods)
+library(plotrix)
+library(vsn)
+library(limma)
+library(SummarizedExperiment)
+library(omicsTools)   # provides differential_expression(), RLE(), etc.
+library(readxl)
+
+############################################################
+# 1. Normalization function
+############################################################
+
+#' Normalize RNA-seq counts and perform QC
+#'
+#' @param X genes-by-samples count matrix
+#' @param gene.annotation data.frame with gene annotations (rownames must match rownames(X))
+#' @param sample.annotation data.frame with sample annotations (rownames must match colnames(X))
+#' @param col.by column of sample.annotation used to color plots; coerced to factor
+#' @param prior.count prior.count for edgeR::cpm()
+#' @param out_dir output directory for QC plots
+#' @param pal color palette; length must match number of factor levels in col.by
+#' @param nFeatures number of most variable features (by sd) used for PCA
+#' @param width,height,res,units graphical parameters
+#' @param pca.text whether to print sample labels on PCA plots
+#' @param design design matrix used for DESeq2 (if NULL, ~1 is used and vst(blind=TRUE))
+#'
+#' @return list with:
+#'   dge          edgeR DGEList object
+#'   lcpm         log-CPM matrix (TMM-normalized)
+#'   dds          DESeq2 DESeqDataSet object
+#'   vsd          DESeq2 variance-stabilized data (vst, blind=TRUE)
+#'   vsdbf        DESeq2 variance-stabilized data (vst, blind=FALSE) if design provided
+#'   res_pca      PCA result on lcpm
+#'   res_pca_vst  PCA result on vst values
+#'   var_feat     features used for PCA on lcpm
+#'   var_feat_vst features used for PCA on vst values
+normalize_counts <- function(
+  X                  = NULL,
+  gene.annotation    = NULL,
+  sample.annotation  = NULL,
+  col.by             = "condition",
+  out_dir            = "./",
+  pal                = NULL,
+  nFeatures          = 2000,
+  width              = 180,
+  height             = 180,
+  res                = 300,
+  units              = "mm",
+  prior.count        = 3,
+  pca.text           = TRUE,
+  design             = NULL
+) {
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  if (is.null(X) || is.null(sample.annotation)) {
+    stop("X and sample.annotation are mandatory.\n")
+  }
+
+  # Design matrix / DESeq2 blind option
+  do.blind.false <- TRUE
+  if (is.null(design)) {
+    design <- model.matrix(~1, data = sample.annotation)
+    cat("No design matrix provided, using ~ 1 and setting blind = TRUE for vst().\n")
+    do.blind.false <- FALSE
+  }
+
+  # Check matching gene annotation
+  if (!is.null(gene.annotation)) {
+    if (!identical(rownames(X), rownames(gene.annotation))) {
+      stop("rownames(X) must be identical to rownames(gene.annotation).\n")
+    }
+  }
+
+  # Check matching sample annotation
+  if (!identical(colnames(X), rownames(sample.annotation))) {
+    stop("colnames(X) must be identical to rownames(sample.annotation).\n")
+  }
+
+  # Condition factor for coloring
+  if (!col.by %in% colnames(sample.annotation)) {
+    cat(col.by, "not found among colnames(sample.annotation).\n")
+  }
+  condition <- factor(
+    x      = sample.annotation[, col.by],
+    levels = unique(sample.annotation[, col.by])
+  )
+  names(condition) <- rownames(sample.annotation)
+
+  # Color palette
+  if (is.null(pal)) {
+    pal <- pals::alphabet(length(levels(condition)))
+  }
+  col_vec <- pal[as.numeric(condition)]
+
+  ## Build DESeq2 object
+  dds <- DESeqDataSetFromMatrix(
+    countData = X,
+    colData   = sample.annotation,
+    design    = design
+  )
+
+  ## edgeR objects and log-CPM
+  dge <- DGEList(
+    counts  = X,
+    genes   = gene.annotation,
+    samples = sample.annotation
+  )
+
+  # log-CPM (raw)
+  lcpm <- cpm(dge, log = TRUE, prior.count = prior.count)
+
+  # TMM normalization
+  cat("TMM normalization...\n")
+  dge <- calcNormFactors(dge, method = "TMM")
+
+  # log-CPM after TMM
+  lcpm <- cpm(dge, log = TRUE, prior.count = prior.count)
+
+  ## DESeq2 variance stabilizing transform
+  dds  <- estimateSizeFactors(dds)
+  dds  <- estimateDispersions(dds)
+  vsd  <- vst(dds, blind = TRUE)
+  vsdbf <- NULL
+  if (do.blind.false) {
+    vsdbf <- vst(dds, blind = FALSE)
+  }
+
+  ## mean-SD plots
+  jpeg(
+    filename = file.path(out_dir, "meansd_vst.jpg"),
+    width    = width,
+    height   = height,
+    res      = res,
+    units    = units
+  )
+  meanSdPlot(assay(vsd))
+  dev.off()
+
+  jpeg(
+    filename = file.path(out_dir, "meansd_logcpm_tmm.jpg"),
+    width    = width,
+    height   = height,
+    res      = res,
+    units    = units
+  )
+  meanSdPlot(lcpm)
+  dev.off()
+
+  ## Library sizes
+  png(
+    filename = file.path(out_dir, "library_sizes.png"),
+    width    = width,
+    height   = height,
+    units    = units,
+    res      = res
+  )
+  par(mar = c(6, 5, 4, 1))
+  par(mgp = c(2, 0.5, 0))
+  barplot(
+    dge$samples$lib.size,
+    las       = 2,
+    names.arg = rownames(dge$samples),
+    col       = col_vec,
+    cex.lab   = 0.6,
+    cex.names = 0.45,
+    cex.axis  = 0.6,
+    xlab      = "",
+    ylab      = "# reads",
+    main      = "Library size"
+  )
+  dev.off()
+
+  ## RLE plots
+  # NOTE: requires RLE() function (e.g. from omicsTools or local RLE.R)
+  jpeg(
+    filename = file.path(out_dir, "RLE.jpg"),
+    width    = width,
+    height   = height / 2,
+    res      = res,
+    units    = units
+  )
+  par(mgp = c(2, 0.5, 0))
+  par(mfrow = c(1, 2))
+  boxplot(
+    RLE(lcpm, robust = FALSE),
+    cex       = 0.7,
+    col       = col_vec,
+    outline   = FALSE,
+    las       = 2,
+    cex.axis  = 0.7,
+    ylab      = "RLE",
+    main      = "log-CPM + TMM",
+    cex.lab   = 0.6
+  )
+  boxplot(
+    RLE(assay(vsd), robust = FALSE),
+    cex       = 0.7,
+    col       = col_vec,
+    outline   = FALSE,
+    las       = 2,
+    cex.axis  = 0.7,
+    ylab      = "RLE",
+    main      = "sizeFactor + vst",
+    cex.lab   = 0.6
+  )
+  dev.off()
+
+  ## PCA
+  var_feat     <- NULL
+  var_feat_vst <- NULL
+
+  if (!is.null(nFeatures) && length(nFeatures) > 0) {
+    # top variable features on lcpm
+    sds <- apply(lcpm, 1, sd)
+    ord <- order(-sds)
+    var_feat <- ord[seq_len(min(length(ord), nFeatures))]
+
+    # top variable features on vst
+    sds_vst <- apply(assay(vsd), 1, sd)
+    ord_vst <- order(-sds_vst)
+    var_feat_vst <- ord_vst[seq_len(min(length(ord_vst), nFeatures))]
+  }
+
+  res_pca <- pca(
+    t(lcpm),
+    center = TRUE,
+    scale  = "uv",
+    subset = var_feat
+  )
+  print(res_pca)
+
+  res_pca_vst <- pcaMethods::pca(
+    t(assay(vsd)),
+    center = TRUE,
+    scale  = "uv",
+    subset = var_feat_vst
+  )
+  print(res_pca_vst)
+
+  jpeg(
+    filename = file.path(out_dir, "pca.jpg"),
+    width    = width,
+    height   = height / 2,
+    res      = res,
+    units    = units
+  )
+  layout(matrix(1:3, nrow = 1, byrow = TRUE), widths = c(0.42, 0.42, 0.16))
+  par(mar = c(3, 3, 3, 2))
+  par(mgp = c(2, 0.5, 0))
+
+  # PCA on lcpm
+  plot(
+    res_pca@scores,
+    pch      = 21,
+    bg       = col_vec,
+    cex.axis = 0.6,
+    cex.lab  = 0.6,
+    xlab     = paste0("PC1 (", format(res_pca@R2[1], digits = 3), ")"),
+    ylab     = paste0("PC2 (", format(res_pca@R2[2], digits = 3), ")"),
+    main     = "lcpm"
+  )
+  if (pca.text) {
+    par(xpd = TRUE)
+    plotrix::thigmophobe.labels(
+      res_pca@scores[, 1],
+      res_pca@scores[, 2],
+      labels = rownames(res_pca@scores),
+      cex    = 0.5,
+      xpd    = TRUE,
+      col    = col_vec,
+      font   = 2
+    )
+  }
+
+  # PCA on vst
+  plot(
+    res_pca_vst@scores,
+    pch      = 21,
+    bg       = col_vec,
+    cex.axis = 0.6,
+    cex.lab  = 0.6,
+    xlab     = paste0("PC1 (", format(res_pca_vst@R2[1], digits = 3), ")"),
+    ylab     = paste0("PC2 (", format(res_pca_vst@R2[2], digits = 3), ")"),
+    main     = "vst"
+  )
+  if (pca.text) {
+    par(xpd = TRUE)
+    plotrix::thigmophobe.labels(
+      res_pca_vst@scores[, 1],
+      res_pca_vst@scores[, 2],
+      labels = rownames(res_pca_vst@scores),
+      cex    = 0.5,
+      xpd    = TRUE,
+      col    = col_vec,
+      font   = 2
+    )
+  }
+
+  # Legend
+  par(mar = c(0.1, 0.1, 0.1, 0.1))
+  plot.new()
+  legend(
+    "center",
+    legend = levels(condition),
+    col    = pal,
+    cex    = 0.5,
+    pch    = 16
+  )
+  dev.off()
+
+  ## MDS plot
+  jpeg(
+    filename = file.path(out_dir, "mds.jpg"),
+    width    = width,
+    height   = height,
+    res      = res,
+    units    = units
+  )
+  layout(matrix(c(1, 2), nrow = 1, byrow = TRUE), widths = c(0.85, 0.15))
+  par(mar = c(3, 3, 1, 1))
+  par(mgp = c(2, 0.5, 0))
+
+  plotMDS(lcpm, col = col_vec, cex = 0.6, xpd = TRUE)
+
+  par(mar = c(0.1, 0.1, 0.1, 0.1))
+  plot.new()
+  legend(
+    "center",
+    legend = levels(condition),
+    col    = pal,
+    cex    = 0.5,
+    pch    = 16
+  )
+  dev.off()
+
+  return(list(
+    dge          = dge,
+    lcpm         = lcpm,
+    dds          = dds,
+    vsd          = vsd,
+    vsdbf        = vsdbf,
+    res_pca      = res_pca,
+    res_pca_vst  = res_pca_vst,
+    var_feat     = var_feat,
+    var_feat_vst = var_feat_vst
+  ))
+}
+
+############################################################
+# 2. Run normalization on filtered GSE63577
+############################################################
+
+# Assumes the following objects already exist from Script 1:
+# - GSE63577_filtered : filtered count matrix
+# - sample_info       : sample annotation data.frame
+# - gene_info         : gene annotation data.frame
+
+# Optional: local implementation of RLE()
+# source("RLE.R")
+
+# Design matrix by passage (young vs old) per cell line
+design_matrix <- model.matrix(~ 0 + Passage, data = sample_info)
+
+# Run normalization
+norm_res <- normalize_counts(
+  X                 = GSE63577_filtered,
+  gene.annotation   = gene_info,
+  sample.annotation = sample_info,
+  col.by            = "Passage",
+  out_dir           = "normalizing_result",
+  design            = design_matrix
+)
+
+# edgeR DGEList for differential expression
+dge <- norm_res$dge
+
+############################################################
+# 3. Differential expression analysis
+############################################################
+
+# Design matrix (again, for clarity)
+design <- model.matrix(~ 0 + Passage, data = sample_info)
+rownames(design) <- rownames(sample_info)
+
+# Check design
+print(dim(design))
+print(rownames(design))
+print(colnames(design))
+
+# Contrast matrix: old vs young for each cell type
+cont_mat <- makeContrasts(
+  oHFF_yHFF   = PassageHFFold  - PassageHFFyoung,
+  oMRC5_yMRC5 = PassageMRCold  - PassageMRCyoung,
+  oIMR90_yIMR90 = PassageIMRold  - PassageIMRyoung,
+  oBJ_yBJ     = PassageBJold   - PassageBJyoung,
+  oWI38_yWI38 = PassageWIold   - PassageWIyoung,
+  levels      = design
+)
+
+# Run differential expression using omicsTools helper
+# See ?differential_expression in omicsTools for details.
+df_deg <- differential_expression(
+  dge              = dge,
+  design           = design,
+  contr_mat        = cont_mat,
+  out_dir          = "DEG_result",
+  top_genes        = 10,
+  top_genes_column = "GeneID"
+)
+
+############################################################
+# 4. Post-processing DEGs and annotation merge
+############################################################
+
+# Load gene annotation table with biotype and Entrez IDs
+# (must contain column 'gene_id' to match GeneID)
+Homo_sapiens_GRCh38_110_gtf_entrez <- read_excel(
+  "Homo_sapiens.GRCh38.110.gtf.entrez.xlsx"
+)
+
+# Extract per-contrast tables
+degs_HFF   <- df_deg$tt$oHFF_yHFF
+degs_MRC   <- df_deg$tt$oMRC5_yMRC5
+degs_BJ    <- df_deg$tt$oBJ_yBJ
+degs_IMR   <- df_deg$tt$oIMR90_yIMR90
+degs_WI38  <- df_deg$tt$oWI38_yWI38
+
+# Check missing logFC
+sum(is.na(degs_HFF$logFC))
+sum(is.na(degs_MRC$logFC))
+sum(is.na(degs_BJ$logFC))
+sum(is.na(degs_IMR$logFC))
+sum(is.na(degs_WI38$logFC))
+
+# Order by logFC (descending)
+degs_HFF  <- degs_HFF[order(degs_HFF$logFC, decreasing = TRUE), ]
+degs_MRC  <- degs_MRC[order(degs_MRC$logFC, decreasing = TRUE), ]
+degs_BJ   <- degs_BJ[order(degs_BJ$logFC,  decreasing = TRUE), ]
+degs_IMR  <- degs_IMR[order(degs_IMR$logFC, decreasing = TRUE), ]
+degs_WI38 <- degs_WI38[order(degs_WI38$logFC, decreasing = TRUE), ]
+
+# Merge with external gene annotation
+merge_deg_annot <- function(deg_table, annot) {
+  merge(
+    deg_table,
+    annot,
+    by.x    = "GeneID",
+    by.y    = "gene_id",
+    all.y   = TRUE,
+    sort    = FALSE,
+    suffixes = c("_deg", "_annot")
+  )
+}
+
+degs_HFF   <- merge_deg_annot(degs_HFF,   Homo_sapiens_GRCh38_110_gtf_entrez)
+degs_MRC   <- merge_deg_annot(degs_MRC,   Homo_sapiens_GRCh38_110_gtf_entrez)
+degs_BJ    <- merge_deg_annot(degs_BJ,    Homo_sapiens_GRCh38_110_gtf_entrez)
+degs_IMR   <- merge_deg_annot(degs_IMR,   Homo_sapiens_GRCh38_110_gtf_entrez)
+degs_WI38  <- merge_deg_annot(degs_WI38,  Homo_sapiens_GRCh38_110_gtf_entrez)
+
+# Re-check missing logFC after merge
+sum(is.na(degs_HFF$logFC))
+sum(is.na(degs_MRC$logFC))
+sum(is.na(degs_BJ$logFC))
+sum(is.na(degs_IMR$logFC))
+sum(is.na(degs_WI38$logFC))
+
+# Check duplicated gene IDs
+sum(duplicated(degs_HFF$GeneID))
+sum(duplicated(degs_MRC$GeneID))
+sum(duplicated(degs_BJ$GeneID))
+sum(duplicated(degs_IMR$GeneID))
+sum(duplicated(degs_WI38$GeneID))
+
+# Remove rows with NA logFC (keep only genes with calculated fold change)
+degs_HFF   <- degs_HFF[!is.na(degs_HFF$logFC), ]
+degs_MRC   <- degs_MRC[!is.na(degs_MRC$logFC), ]
+degs_BJ    <- degs_BJ[!is.na(degs_BJ$logFC), ]
+degs_IMR   <- degs_IMR[!is.na(degs_IMR$logFC), ]
+degs_WI38  <- degs_WI38[!is.na(degs_WI38$logFC), ]
+
+# Quick biotype sanity checks
+sum(is.na(degs_HFF$gene_biotype))
+sum(is.na(degs_MRC$gene_biotype))
+sum(is.na(degs_BJ$gene_biotype))
+sum(is.na(degs_IMR$gene_biotype))
+sum(is.na(degs_WI38$gene_biotype))
+
+table(degs_HFF$gene_biotype)
+table(degs_MRC$gene_biotype)
+table(degs_BJ$gene_biotype)
+table(degs_IMR$gene_biotype)
+table(degs_WI38$gene_biotype)
+
+# Optionally drop extra columns (adapt indices to your actual annotation)
+degs_HFF   <- degs_HFF[, -c(8:17)]
+degs_MRC   <- degs_MRC[, -c(8:17)]
+degs_BJ    <- degs_BJ[, -c(8:17)]
+degs_IMR   <- degs_IMR[, -c(8:17)]
+degs_WI38  <- degs_WI38[, -c(8:17)]
+
+############################################################
+# End of script
+############################################################
