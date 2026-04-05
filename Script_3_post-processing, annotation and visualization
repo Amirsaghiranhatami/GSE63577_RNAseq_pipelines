@@ -1,0 +1,539 @@
+############################################################
+# GSE63577: post-processing, annotation and visualization
+# - Export raw count matrix with annotation
+# - Build per-contrast DEG tables with flags
+# - Extract lncRNA and protein-coding DEGs
+# - UpSet plots for shared DEGs
+# - Volcano plots
+# - Heatmaps for modulated lncRNAs and protein-coding genes
+############################################################
+
+## 0. Libraries and configuration ---------------------------------------------
+
+library(data.table)
+library(openxlsx)
+library(readxl)
+library(dplyr)
+library(UpSetR)
+library(ComplexHeatmap)
+library(ggplot2)
+library(EnhancedVolcano)
+library(limma)
+
+# Paths (adapt to your project structure)
+raw_counts_url <- paste(
+  "https://www.ncbi.nlm.nih.gov/geo/download/?format=file&type=rnaseq_counts",
+  "acc=GSE63577",
+  "file=GSE63577_raw_counts_GRCh38.p13_NCBI.tsv.gz",
+  sep = "&"
+)
+
+gene_annot_file <- "Homo_sapiens.GRCh38.110.gtf.entrez.xlsx"
+output_dir      <- "results_to_do_list"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Thresholds for DEGs
+adjp_value_threshold <- 0.05
+logFC_threshold      <- 0.58
+
+############################################################
+# 1. Load raw matrix and export annotated raw counts
+############################################################
+
+# Read raw counts (same source as Scripts 1–2)
+raw_dt <- data.table::fread(raw_counts_url, header = TRUE)
+raw_counts <- as.data.frame(raw_dt)
+rownames(raw_counts) <- raw_counts$GeneID
+raw_counts$GeneID <- NULL
+
+# Remove middle-stage samples (MRC5 and HFF; same as Script 1)
+raw_counts <- raw_counts[, -c(28:36, 40:45)]
+
+# Read external gene annotation
+gene_annot <- readxl::read_excel(gene_annot_file)
+
+# Merge raw counts with annotation by gene ID
+raw_counts_annot <- raw_counts
+raw_counts_annot$GeneID <- rownames(raw_counts_annot)
+
+raw_counts_annot <- merge(
+  raw_counts_annot,
+  gene_annot,
+  by.x    = "GeneID",
+  by.y    = "gene_id",
+  all.y   = TRUE,
+  sort    = FALSE,
+  suffixes = c("_counts", "_annot")
+)
+
+# Export annotated raw matrix
+write.xlsx(
+  raw_counts_annot,
+  file.path(output_dir, "Raw_Matrix_GSE63577_annotated.xlsx")
+)
+
+############################################################
+# 2. DEG tables for each comparison (with annotation + flags)
+############################################################
+
+# Assumes df_deg from Script 2 is loaded:
+# - df_deg$fit : limma fit object
+# - df_deg$tt  : list of top tables per contrast
+
+fit <- df_deg$fit
+tt_list <- df_deg$tt
+
+print(colnames(fit$coefficients))  # sanity check
+
+# Helper function: get annotated DEG table for one contrast
+get_deg_table <- function(fit, coef_name, annot, label,
+                          adjp_thresh = 0.05, logfc_thresh = 0.58,
+                          out_dir = output_dir) {
+  tt <- topTable(
+    fit,
+    coef           = coef_name,
+    number         = Inf,
+    adjust.method  = "BH"
+  )
+
+  # Order by logFC (descending)
+  tt <- tt[order(tt$logFC, decreasing = TRUE), ]
+
+  # Merge with gene annotation
+  tt_annot <- merge(
+    tt,
+    annot,
+    by.x    = "GeneID",
+    by.y    = "gene_id",
+    all.y   = TRUE,
+    sort    = FALSE,
+    suffixes = c("_deg", "_annot")
+  )
+
+  # Remove NA logFC rows
+  tt_annot <- tt_annot[!is.na(tt_annot$logFC), ]
+
+  # Flag: up, down, NS
+  tt_annot$flag <- ifelse(
+    tt_annot$adj.P.Val < adjp_thresh & tt_annot$logFC >  logfc_thresh, "up",
+    ifelse(
+      tt_annot$adj.P.Val < adjp_thresh & tt_annot$logFC < -logfc_thresh, "down",
+      "NS"
+    )
+  )
+
+  print(table(tt_annot$flag))
+  if ("gene_biotype" %in% colnames(tt_annot)) {
+    print(table(tt_annot$gene_biotype))
+  }
+
+  # Export to Excel
+  out_file <- file.path(
+    out_dir,
+    paste0(label, "_adjp", adjp_thresh, "_logFC", logfc_thresh, ".xlsx")
+  )
+  write.xlsx(tt_annot, out_file)
+
+  tt_annot
+}
+
+# Build DEG tables per contrast
+oHFF_yHFF   <- get_deg_table(fit, "oHFF_yHFF",   gene_annot, "oHFF_yHFF")
+oMRC5_yMRC5 <- get_deg_table(fit, "oMRC5_yMRC5", gene_annot, "oMRC5_yMRC5")
+oIMR90_yIMR90 <- get_deg_table(fit, "oIMR90_yIMR90", gene_annot, "oIMR90_yIMR90")
+oBJ_yBJ     <- get_deg_table(fit, "oBJ_yBJ",     gene_annot, "oBJ_yBJ")
+oWI38_yWI38 <- get_deg_table(fit, "oWI38_yWI38", gene_annot, "oWI38_yWI38")
+
+############################################################
+# 3. LncRNA subsets and UpSet for lncRNAs
+############################################################
+
+# Extract lncRNA from each contrast (keep up/down/NS)
+lnc_from_deg <- function(deg_table) {
+  deg_table %>%
+    filter(gene_biotype == "lncRNA", flag %in% c("up", "down", "NS"))
+}
+
+LncoHFF_yHFF   <- lnc_from_deg(oHFF_yHFF)
+LncoMRC5_yMRC5 <- lnc_from_deg(oMRC5_yMRC5)
+LncoIMR90_yIMR90 <- lnc_from_deg(oIMR90_yIMR90)
+LncoBJ_yBJ     <- lnc_from_deg(oBJ_yBJ)
+LncoWI38_yWI38 <- lnc_from_deg(oWI38_yWI38)
+
+write.xlsx(LncoHFF_yHFF,
+           file.path(output_dir, "lncRNA_oHFF_yHFF_allflags.xlsx"))
+write.xlsx(LncoMRC5_yMRC5,
+           file.path(output_dir, "lncRNA_oMRC5_yMRC5_allflags.xlsx"))
+write.xlsx(LncoIMR90_yIMR90,
+           file.path(output_dir, "lncRNA_oIMR90_yIMR90_allflags.xlsx"))
+write.xlsx(LncoBJ_yBJ,
+           file.path(output_dir, "lncRNA_oBJ_yBJ_allflags.xlsx"))
+write.xlsx(LncoWI38_yWI38,
+           file.path(output_dir, "lncRNA_oWI38_yWI38_allflags.xlsx"))
+
+# Keep only up/down for overlap analysis
+lnc_ud <- function(x) x[x$flag %in% c("up", "down"), ]
+
+LncoHFF_yHFF_ud   <- lnc_ud(LncoHFF_yHFF)
+LncoMRC5_yMRC5_ud <- lnc_ud(LncoMRC5_yMRC5)
+LncoIMR90_yIMR90_ud <- lnc_ud(LncoIMR90_yIMR90)
+LncoBJ_yBJ_ud     <- lnc_ud(LncoBJ_yBJ)
+LncoWI38_yWI38_ud <- lnc_ud(LncoWI38_yWI38)
+
+# Gene sets
+genes_oHFF_yHFF   <- unique(LncoHFF_yHFF_ud$GeneID)
+genes_oMRC5_yMRC5 <- unique(LncoMRC5_yMRC5_ud$GeneID)
+genes_oIMR90_yIMR90 <- unique(LncoIMR90_yIMR90_ud$GeneID)
+genes_oBJ_yBJ     <- unique(LncoBJ_yBJ_ud$GeneID)
+genes_oWI38_yWI38 <- unique(LncoWI38_yWI38_ud$GeneID)
+
+all_genes <- unique(c(
+  genes_oHFF_yHFF,
+  genes_oMRC5_yMRC5,
+  genes_oIMR90_yIMR90,
+  genes_oBJ_yBJ,
+  genes_oWI38_yWI38
+))
+
+lnc_upset_data <- data.frame(
+  Gene         = all_genes,
+  oHFF_yHFF    = as.integer(all_genes %in% genes_oHFF_yHFF),
+  oMRC5_yMRC5  = as.integer(all_genes %in% genes_oMRC5_yMRC5),
+  oIMR90_yIMR90 = as.integer(all_genes %in% genes_oIMR90_yIMR90),
+  oBJ_yBJ      = as.integer(all_genes %in% genes_oBJ_yBJ),
+  oWI38_yWI38  = as.integer(all_genes %in% genes_oWI38_yWI38)
+)
+
+# UpSet plot (lncRNA)
+upset(
+  lnc_upset_data,
+  sets     = c("oHFF_yHFF", "oMRC5_yMRC5", "oIMR90_yIMR90", "oBJ_yBJ", "oWI38_yWI38"),
+  order.by = "freq",
+  text.scale = c(2, 2, 2, 2, 2, 2)
+)
+
+# Common lncRNA in all 5 comparisons
+common_lnc_all <- lnc_upset_data %>%
+  dplyr::filter(
+    oHFF_yHFF == 1,
+    oMRC5_yMRC5 == 1,
+    oIMR90_yIMR90 == 1,
+    oBJ_yBJ == 1,
+    oWI38_yWI38 == 1
+  ) %>%
+  dplyr::select(Gene)
+
+# Common lncRNA in at least 3 comparisons
+common_lnc_3plus <- lnc_upset_data %>%
+  rowwise() %>%
+  mutate(total = sum(c_across(oHFF_yHFF:oWI38_yWI38))) %>%
+  ungroup() %>%
+  filter(total >= 3) %>%
+  pull(Gene)
+
+# Helper: merge per-contrast tables for a given set of genes
+merge_common_degs <- function(genes, hff, mrc5, imr, bj, wi38,
+                              suffix_hff = ".HFF",
+                              suffix_mrc5 = ".MRC5",
+                              suffix_imr = ".IMR",
+                              suffix_bj = ".BJ",
+                              suffix_wi38 = ".WI38") {
+
+  # Filter on selected genes (up/down only)
+  hff_f   <- hff[hff$GeneID   %in% genes, ]
+  mrc5_f  <- mrc5[mrc5$GeneID %in% genes, ]
+  imr_f   <- imr[imr$GeneID   %in% genes, ]
+  bj_f    <- bj[bj$GeneID     %in% genes, ]
+  wi38_f  <- wi38[wi38$GeneID %in% genes, ]
+
+  # Add suffix to column names, keep GeneID
+  hff_f   <- hff_f  %>% rename_with(~ paste0(., suffix_hff),   -GeneID)
+  mrc5_f  <- mrc5_f %>% rename_with(~ paste0(., suffix_mrc5),  -GeneID)
+  imr_f   <- imr_f  %>% rename_with(~ paste0(., suffix_imr),   -GeneID)
+  bj_f    <- bj_f   %>% rename_with(~ paste0(., suffix_bj),    -GeneID)
+  wi38_f  <- wi38_f %>% rename_with(~ paste0(., suffix_wi38),  -GeneID)
+
+  merged <- hff_f %>%
+    full_join(mrc5_f, by = "GeneID") %>%
+    full_join(imr_f,  by = "GeneID") %>%
+    full_join(bj_f,   by = "GeneID") %>%
+    full_join(wi38_f, by = "GeneID")
+
+  merged
+}
+
+# Fully annotated common lncRNAs (5/5)
+merged_lnc_all <- merge_common_degs(
+  genes = common_lnc_all$Gene,
+  hff   = LncoHFF_yHFF_ud,
+  mrc5  = LncoMRC5_yMRC5_ud,
+  imr   = LncoIMR90_yIMR90_ud,
+  bj    = LncoBJ_yBJ_ud,
+  wi38  = LncoWI38_yWI38_ud
+)
+
+write.xlsx(
+  merged_lnc_all,
+  file.path(output_dir, "common_lncRNA_all5_comparisons.xlsx")
+)
+
+# Common lncRNAs in >= 3 comparisons
+merged_lnc_3plus <- merge_common_degs(
+  genes = common_lnc_3plus,
+  hff   = LncoHFF_yHFF_ud,
+  mrc5  = LncoMRC5_yMRC5_ud,
+  imr   = LncoIMR90_yIMR90_ud,
+  bj    = LncoBJ_yBJ_ud,
+  wi38  = LncoWI38_yWI38_ud
+)
+
+write.xlsx(
+  merged_lnc_3plus,
+  file.path(output_dir, "common_lncRNA_at_least3_comparisons.xlsx")
+)
+
+############################################################
+# 4. Protein-coding subsets and UpSet
+############################################################
+
+pc_from_deg <- function(deg_table) {
+  deg_table %>%
+    filter(gene_biotype == "protein_coding")
+}
+
+PCoHFF_yHFF   <- pc_from_deg(oHFF_yHFF)
+PCoMRC5_yMRC5 <- pc_from_deg(oMRC5_yMRC5)
+PCoIMR90_yIMR90 <- pc_from_deg(oIMR90_yIMR90)
+PCoBJ_yBJ     <- pc_from_deg(oBJ_yBJ)
+PCoWI38_yWI38 <- pc_from_deg(oWI38_yWI38)
+
+# up/down only
+pc_ud <- function(x) x[x$flag %in% c("up", "down"), ]
+
+PCoHFF_yHFF_ud   <- pc_ud(PCoHFF_yHFF)
+PCoMRC5_yMRC5_ud <- pc_ud(PCoMRC5_yMRC5)
+PCoIMR90_yIMR90_ud <- pc_ud(PCoIMR90_yIMR90)
+PCoBJ_yBJ_ud     <- pc_ud(PCoBJ_yBJ)
+PCoWI38_yWI38_ud <- pc_ud(PCoWI38_yWI38)
+
+# Gene sets
+PCgenes_oHFF_yHFF   <- unique(PCoHFF_yHFF_ud$GeneID)
+PCgenes_oMRC5_yMRC5 <- unique(PCoMRC5_yMRC5_ud$GeneID)
+PCgenes_oIMR90_yIMR90 <- unique(PCoIMR90_yIMR90_ud$GeneID)
+PCgenes_oBJ_yBJ     <- unique(PCoBJ_yBJ_ud$GeneID)
+PCgenes_oWI38_yWI38 <- unique(PCoWI38_yWI38_ud$GeneID)
+
+PCall_genes <- unique(c(
+  PCgenes_oHFF_yHFF,
+  PCgenes_oMRC5_yMRC5,
+  PCgenes_oIMR90_yIMR90,
+  PCgenes_oBJ_yBJ,
+  PCgenes_oWI38_yWI38
+))
+
+PCupset_data <- data.frame(
+  Gene         = PCall_genes,
+  oHFF_yHFF    = as.integer(PCall_genes %in% PCgenes_oHFF_yHFF),
+  oMRC5_yMRC5  = as.integer(PCall_genes %in% PCgenes_oMRC5_yMRC5),
+  oIMR90_yIMR90 = as.integer(PCall_genes %in% PCgenes_oIMR90_yIMR90),
+  oBJ_yBJ      = as.integer(PCall_genes %in% PCgenes_oBJ_yBJ),
+  oWI38_yWI38  = as.integer(PCall_genes %in% PCgenes_oWI38_yWI38)
+)
+
+upset(
+  PCupset_data,
+  sets     = c("oHFF_yHFF", "oMRC5_yMRC5", "oIMR90_yIMR90", "oBJ_yBJ", "oWI38_yWI38"),
+  order.by = "freq",
+  text.scale = c(2, 2, 2, 2, 2, 2)
+)
+
+# Common protein-coding genes (5/5)
+PC_common_all <- PCupset_data %>%
+  filter(
+    oHFF_yHFF == 1,
+    oMRC5_yMRC5 == 1,
+    oIMR90_yIMR90 == 1,
+    oBJ_yBJ == 1,
+    oWI38_yWI38 == 1
+  ) %>%
+  select(Gene)
+
+PCmerged_all <- merge_common_degs(
+  genes = PC_common_all$Gene,
+  hff   = PCoHFF_yHFF_ud,
+  mrc5  = PCoMRC5_yMRC5_ud,
+  imr   = PCoIMR90_yIMR90_ud,
+  bj    = PCoBJ_yBJ_ud,
+  wi38  = PCoWI38_yWI38_ud
+)
+
+write.xlsx(
+  PCmerged_all,
+  file.path(output_dir, "common_protein_coding_all5_comparisons.xlsx")
+)
+
+# Common protein-coding in >= 3 comparisons
+PC_common_3plus <- PCupset_data %>%
+  rowwise() %>%
+  mutate(total = sum(c_across(oHFF_yHFF:oWI38_yWI38))) %>%
+  ungroup() %>%
+  filter(total >= 3) %>%
+  pull(Gene)
+
+PCmerged_3plus <- merge_common_degs(
+  genes = PC_common_3plus,
+  hff   = PCoHFF_yHFF_ud,
+  mrc5  = PCoMRC5_yMRC5_ud,
+  imr   = PCoIMR90_yIMR90_ud,
+  bj    = PCoBJ_yBJ_ud,
+  wi38  = PCoWI38_yWI38_ud
+)
+
+write.xlsx(
+  PCmerged_3plus,
+  file.path(output_dir, "common_protein_coding_at_least3_comparisons.xlsx")
+)
+
+############################################################
+# 5. Volcano plots (EnhancedVolcano)
+############################################################
+
+make_volcano <- function(deg_table, label, ylim_max = 20,
+                         adjp_thresh = adjp_value_threshold,
+                         logfc_thresh = logFC_threshold) {
+
+  up_genes   <- deg_table %>% filter(flag == "up")
+  down_genes <- deg_table %>% filter(flag == "down")
+
+  n_up   <- nrow(up_genes)
+  n_down <- nrow(down_genes)
+  n_tot  <- n_up + n_down
+
+  plot_title <- paste(
+    label,
+    "- Up:", n_up,
+    "- Down:", n_down,
+    "- Total significant:", n_tot
+  )
+
+  EnhancedVolcano(
+    deg_table,
+    lab          = deg_table$gene_name,
+    x            = "logFC",
+    y            = "adj.P.Val",
+    ylim         = c(0, ylim_max),
+    title        = plot_title,
+    pCutoff      = adjp_thresh,
+    FCcutoff     = logfc_thresh,
+    ylab         = expression(-Log[10] ~ adj ~ p.value),
+    legendLabels = c(
+      "NS",
+      expression(Log[2] ~ FC),
+      "adjp-value",
+      expression(adjp - value ~ and ~ Log[2] ~ FC)
+    )
+  )
+}
+
+V1 <- make_volcano(oHFF_yHFF,   "oHFF vs yHFF",   ylim_max = 22)
+V2 <- make_volcano(oMRC5_yMRC5, "oMRC5 vs yMRC5", ylim_max = 15)
+V3 <- make_volcano(oIMR90_yIMR90, "oIMR90 vs yIMR90", ylim_max = 10)
+V4 <- make_volcano(oBJ_yBJ,     "oBJ vs yBJ",     ylim_max = 20)
+V5 <- make_volcano(oWI38_yWI38, "oWI38 vs yWI38", ylim_max = 20)
+
+############################################################
+# 6. Heatmaps of modulated lncRNAs and protein-coding genes
+############################################################
+
+# Helper: build z-scored expression matrix for given genes from raw counts
+get_top_gene_matrix <- function(tt, counts_mat) {
+  gene_ids <- rownames(tt)
+  mat <- counts_mat[gene_ids, , drop = FALSE]
+  t(scale(t(mat)))
+}
+
+# Reload raw counts once for heatmaps (same filtering as above)
+raw_dt2 <- data.table::fread(raw_counts_url, header = TRUE)
+raw_counts2 <- as.data.frame(raw_dt2)
+rownames(raw_counts2) <- raw_counts2$GeneID
+raw_counts2$GeneID <- NULL
+raw_counts2 <- raw_counts2[, -c(28:36, 40:45)]
+
+#### Heatmaps for modulated lncRNAs (per cell line) ----------------------------
+
+# HFF
+LncoHFF_yHFF_ud_unique <- LncoHFF_yHFF_ud[!duplicated(LncoHFF_yHFF_ud$GeneID), ]
+rownames(LncoHFF_yHFF_ud_unique) <- LncoHFF_yHFF_ud_unique$GeneID
+lnc_HFF_mat <- get_top_gene_matrix(LncoHFF_yHFF_ud_unique, raw_counts2)
+lnc_HFF_mat <- lnc_HFF_mat[, c(10:12, 13:15)]  # adapt indices to yHFF/oHFF samples
+colnames(lnc_HFF_mat) <- c("yHFF.1","yHFF.2","yHFF.3","oHFF.1","oHFF.2","oHFF.3")
+
+htmp_Lnc_HFF <- Heatmap(
+  lnc_HFF_mat,
+  cluster_rows    = FALSE,
+  cluster_columns = FALSE,
+  name            = "Expression",
+  show_row_names  = FALSE
+)
+
+
+
+#### Heatmaps for modulated protein-coding genes (top 50 up + 50 down) --------
+
+# Example: HFF protein-coding
+
+# Annotate raw counts with gene_name to use as rownames
+raw_pc_dt <- data.table::fread(raw_counts_url, header = TRUE)
+raw_pc <- as.data.frame(raw_pc_dt)
+rownames(raw_pc) <- raw_pc$GeneID
+raw_pc$GeneID <- NULL
+raw_pc <- raw_pc[, -c(28:36, 40:45)]
+
+raw_pc$gene_ID <- rownames(raw_pc)
+raw_pc <- merge(
+  raw_pc,
+  gene_annot,
+  by.x    = "gene_ID",
+  by.y    = "gene_id",
+  all.y   = TRUE,
+  sort    = FALSE,
+  suffixes = c("_counts", "_annot")
+)
+raw_pc$gene_name[is.na(raw_pc$gene_name)] <- "NA_gene"
+rownames(raw_pc) <- make.unique(raw_pc$gene_name)
+raw_pc <- raw_pc[, !colnames(raw_pc) %in% c("gene_ID", "gene_name", "gene_biotype")]
+
+# Top 50 up + 50 down protein-coding in HFF
+PCoHFF_yHFF_ud_unique <- PCoHFF_yHFF_ud[!duplicated(PCoHFF_yHFF_ud$GeneID), ]
+
+up_genes_HFF <- PCoHFF_yHFF_ud_unique %>%
+  filter(flag == "up") %>%
+  arrange(desc(logFC)) %>%
+  head(50)
+
+down_genes_HFF <- PCoHFF_yHFF_ud_unique %>%
+  filter(flag == "down") %>%
+  arrange(logFC) %>%
+  head(50)
+
+top_genes_HFF <- rbind(up_genes_HFF, down_genes_HFF)
+rownames(top_genes_HFF) <- make.unique(top_genes_HFF$gene_name)
+top_genes_HFF_sub <- top_genes_HFF[, !colnames(top_genes_HFF) %in% c("GeneID","gene_name","gene_biotype")]
+
+data_PCHFF <- get_top_gene_matrix(top_genes_HFF, raw_pc)
+# Adapt column indices to HFF samples (yHFF/oHFF)
+data_PCHFF <- data_PCHFF[, c(10:12, 13:15)]
+colnames(data_PCHFF) <- c("yHFF.1","yHFF.2","yHFF.3","oHFF.1","oHFF.2","oHFF.3")
+
+htmp_PC_HFF <- Heatmap(
+  data_PCHFF,
+  cluster_rows    = FALSE,
+  cluster_columns = FALSE,
+  name            = "Expression",
+  row_labels      = rownames(data_PCHFF),
+  row_names_gp    = grid::gpar(fontsize = 6)
+)
+
+############################################################
+# End of script
+############################################################
